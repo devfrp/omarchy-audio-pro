@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "id": "devfrp.audio-patchbay",
+  "name": "Audio Patchbay",
+  "version": "1.0.0",
+  "author": "devfrp",
+  "license": "MIT",
+  "homepage": "https://github.com/devfrp/omarchy-audio-pro",
+  "description": "Sample-rate and bit-depth presets scoped to what your device supports, plus a visual virtual patchbay for routing PipeWire ports.",
+  "kinds": ["bar-widget"],
+  "entryPoints": { "barWidget": "BarWidget.qml" },
+  "barWidget": {
+    "displayName": "Audio Patchbay",
+    "description": "Device-aware sample rate & bit-depth presets, visual PipeWire patchbay",
+    "category": "System",
+    "allowMultiple": false
+  }
+}
