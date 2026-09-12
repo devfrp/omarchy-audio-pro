@@ -16,6 +16,10 @@ Panel {
     readonly property color dim: Qt.darker(foreground, 1.55)
     readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
     readonly property string helper: decodeURIComponent(Qt.resolvedUrl("patchbay.py").toString().replace(/^file:\/\//, ""))
+    // Absolute, trusted interpreter path — never a bare "python3" resolved
+    // through inherited PATH, which a shadow executable earlier in PATH
+    // could hijack (github.com/omacom/omarchy-plugin-marketplace#6521).
+    readonly property string python3: "/usr/bin/python3"
 
     readonly property var ratePresets: [
         { key: "auto", label: "Auto", rate: 0, buffer: 0 },
@@ -115,7 +119,7 @@ Panel {
         var preset = pendingPreset
         pendingKind = ""; pendingPreset = ""
         actionKind = kind
-        action.command = ["python3", helper, kind, preset]
+        action.command = [python3, helper, kind, preset]
         action.running = true
     }
 
@@ -143,7 +147,7 @@ Panel {
 
     function doConnect(outId, inId) {
         actionKind = "connect"
-        action.command = ["python3", helper, "connect", outId, inId]
+        action.command = [python3, helper, "connect", outId, inId]
         action.running = true
         clearRouteSelection()
     }
@@ -163,7 +167,7 @@ Panel {
     function disconnectLink(linkId) {
         if (busy) return
         actionKind = "disconnect"
-        action.command = ["python3", helper, "disconnect", String(linkId)]
+        action.command = [python3, helper, "disconnect", String(linkId)]
         action.running = true
     }
 
@@ -171,7 +175,7 @@ Panel {
 
     Process {
         id: status
-        command: ["python3", root.helper, "json"]
+        command: [root.python3, root.helper, "json"]
         stdout: StdioCollector {
             onStreamFinished: {
                 try {

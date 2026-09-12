@@ -6,13 +6,17 @@ pactl. All state-changing actions are reversible: rate/quantum overrides
 clear back to "auto" via pw-metadata, and the bit-depth rule is a single
 owned file removed by its own "auto" preset.
 """
+import errno
 import json
 import os
 from pathlib import Path
 import re
+import selectors
+import signal
+import stat
 import subprocess
 import sys
-import tempfile
+import time
 
 RATE_PRESETS = {
     'auto': (0, 0),
@@ -35,6 +39,18 @@ MARKER = '# Owned by devfrp.audio-patchbay\n'
 AUDIO_MEDIA_CLASSES = (
     'Audio/Sink', 'Audio/Source', 'Stream/Output/Audio', 'Stream/Input/Audio',
 )
+BIT_CONFIG_NAME = '70-audio-patchbay-bitdepth.conf'
+
+# Security-review hardening (github.com/omacom/omarchy-plugin-marketplace#6521):
+# external tools are resolved once against a fixed, trusted directory list —
+# never the inherited PATH, which a shadow executable earlier in PATH could
+# hijack — and every subprocess runs with a closed-down environment, a real
+# wall-clock deadline enforced across its whole process group, and a cap on
+# how much stdout/stderr it may produce.
+TRUSTED_BIN_DIRS = ('/usr/bin', '/usr/local/bin', '/bin')
+MAX_OUTPUT_BYTES = 8 * 1024 * 1024
+RUN_TIMEOUT_SECONDS = 8
+_TOOL_CACHE = {}
 
 
 def _config_root():
@@ -46,12 +62,85 @@ def _config_root():
     return Path.home() / '.config'
 
 
-BIT_CONFIG = _config_root() / 'wireplumber/wireplumber.conf.d/70-audio-patchbay-bitdepth.conf'
+def _trusted_tool(name):
+    if name in _TOOL_CACHE:
+        return _TOOL_CACHE[name]
+    for directory in TRUSTED_BIN_DIRS:
+        candidate = os.path.join(directory, name)
+        if not (os.path.exists(candidate) and os.access(candidate, os.X_OK)):
+            continue
+        resolved = os.path.realpath(candidate)
+        if os.path.dirname(resolved) not in TRUSTED_BIN_DIRS:
+            continue
+        _TOOL_CACHE[name] = resolved
+        return resolved
+    raise RuntimeError(f'Required tool "{name}" was not found in a trusted location '
+                        f'({", ".join(TRUSTED_BIN_DIRS)}).')
+
+
+def _closed_env():
+    keep = ('HOME', 'USER', 'XDG_RUNTIME_DIR', 'XDG_CONFIG_HOME',
+            'DBUS_SESSION_BUS_ADDRESS', 'WAYLAND_DISPLAY')
+    env = {key: os.environ[key] for key in keep if key in os.environ}
+    env['PATH'] = ':'.join(TRUSTED_BIN_DIRS)
+    env['LC_ALL'] = 'C'
+    return env
+
+
+def _kill_process_tree(proc):
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    try:
+        proc.wait(timeout=2)
+    except Exception:
+        pass
 
 
 def run(args):
-    return subprocess.run(args, text=True, capture_output=True, check=True, timeout=8,
-                           env={**os.environ, 'LC_ALL': 'C'}).stdout
+    """Run a trusted tool with a closed environment, a real deadline across
+    its whole process group, and a hard cap on how much output it may
+    produce — a subprocess that stalls, forks, or floods stdout can't hang
+    or exhaust memory in the caller."""
+    resolved = [_trusted_tool(args[0]), *args[1:]]
+    proc = subprocess.Popen(resolved, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             env=_closed_env(), start_new_session=True)
+    sel = selectors.DefaultSelector()
+    sel.register(proc.stdout, selectors.EVENT_READ, 'out')
+    sel.register(proc.stderr, selectors.EVENT_READ, 'err')
+    chunks = {'out': [], 'err': []}
+    sizes = {'out': 0, 'err': 0}
+    open_streams = 2
+    deadline = time.monotonic() + RUN_TIMEOUT_SECONDS
+    try:
+        while open_streams > 0:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(resolved, RUN_TIMEOUT_SECONDS)
+            for key, _mask in sel.select(timeout=remaining):
+                stream = key.data
+                data = os.read(key.fileobj.fileno(), 65536)
+                if data == b'':
+                    sel.unregister(key.fileobj)
+                    open_streams -= 1
+                    continue
+                sizes[stream] += len(data)
+                if sizes[stream] > MAX_OUTPUT_BYTES:
+                    raise RuntimeError(
+                        f'{args[0]} produced more than {MAX_OUTPUT_BYTES} bytes of output.')
+                chunks[stream].append(data)
+        proc.wait(timeout=max(0.0, deadline - time.monotonic()))
+    except (subprocess.TimeoutExpired, RuntimeError):
+        _kill_process_tree(proc)
+        raise
+    finally:
+        sel.close()
+    stdout = b''.join(chunks['out']).decode('utf-8', 'replace')
+    stderr = b''.join(chunks['err']).decode('utf-8', 'replace')
+    if proc.returncode != 0:
+        raise subprocess.CalledProcessError(proc.returncode, resolved, stdout, stderr)
+    return stdout
 
 
 # ---------------------------------------------------------------- graph ----
@@ -225,18 +314,81 @@ def apply_rate(preset):
 
 
 # -------------------------------------------------------------- bit depth --
+#
+# Security-review hardening: every step below the config root opens relative
+# to an already-open, already-verified directory descriptor (`dir_fd=`) with
+# O_NOFOLLOW, so there is exactly one lookup per path component — nothing to
+# race, because a symlink swapped in after the check simply isn't what gets
+# opened. Each descriptor is also checked as owned by us and not group/other
+# -writable before we trust it. The final write goes through a private temp
+# file plus an atomic rename, both addressed by that same descriptor.
 
-def _owned_content(path):
-    if path.is_symlink():
-        raise ValueError(f'Refusing to touch an unowned file: {path}')
+def _verify_owned_fd(fd, label):
+    stat_result = os.fstat(fd)
+    if stat_result.st_uid != os.getuid():
+        os.close(fd)
+        raise ValueError(f'Refusing to use "{label}": not owned by the current user.')
+    if stat_result.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        os.close(fd)
+        raise ValueError(f'Refusing to use "{label}": writable by group or others.')
+
+
+def _open_dir_component(parent_fd, name, create):
+    flags = os.O_DIRECTORY | os.O_NOFOLLOW | os.O_RDONLY | os.O_CLOEXEC
     try:
-        content = path.read_text(encoding='utf-8')
+        fd = os.open(name, flags, dir_fd=parent_fd)
+    except FileNotFoundError:
+        if not create:
+            return None
+        os.mkdir(name, 0o700, dir_fd=parent_fd)
+        fd = os.open(name, flags, dir_fd=parent_fd)
+    except NotADirectoryError as exc:
+        raise ValueError(f'Refusing to use "{name}": not a directory.') from exc
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise ValueError(f'Refusing to follow a symlink at "{name}".') from exc
+        raise
+    _verify_owned_fd(fd, name)
+    return fd
+
+
+def _config_dir_fd(create):
+    """Descriptor for wireplumber/wireplumber.conf.d under the config root,
+    walked one verified component at a time. Returns None (create=False
+    only) if any component along the way doesn't exist yet."""
+    root = _config_root()
+    fd = os.open(str(root), os.O_DIRECTORY | os.O_NOFOLLOW | os.O_RDONLY | os.O_CLOEXEC)
+    _verify_owned_fd(fd, str(root))
+    try:
+        for part in ('wireplumber', 'wireplumber.conf.d'):
+            next_fd = _open_dir_component(fd, part, create)
+            os.close(fd)
+            if next_fd is None:
+                return None
+            fd = next_fd
+        return fd
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def _owned_marker_content(dir_fd, name):
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
+    try:
+        fd = os.open(name, flags, dir_fd=dir_fd)
     except FileNotFoundError:
         return None
-    except (OSError, UnicodeError) as exc:
-        raise ValueError(f'Refusing to touch an unowned file: {path}') from exc
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise ValueError(f'Refusing to touch a symlink: {name}') from exc
+        raise
+    with os.fdopen(fd, 'r', encoding='utf-8') as stream:
+        stat_result = os.fstat(stream.fileno())
+        if not stat.S_ISREG(stat_result.st_mode) or stat_result.st_uid != os.getuid():
+            raise ValueError(f'Refusing to touch an unowned file: {name}')
+        content = stream.read()
     if not content.startswith(MARKER):
-        raise ValueError(f'Refusing to touch an unowned file: {path}')
+        raise ValueError(f'Refusing to touch an unowned file: {name}')
     return content
 
 
@@ -247,43 +399,57 @@ def default_sink_name():
 def apply_bitdepth(preset):
     if preset not in BIT_PRESETS:
         raise ValueError(f'Unknown bit-depth preset: {preset}')
-    _owned_content(BIT_CONFIG)  # validates ownership before any write/removal
-    audio_format = BIT_PRESETS[preset]
-    if audio_format is None:
-        BIT_CONFIG.unlink(missing_ok=True)
-    else:
-        sink = default_sink_name()
-        if not sink.startswith('alsa_output.'):
-            raise ValueError(
-                f'Bit-depth override only supports local ALSA outputs; current default is "{sink}".'
-            )
-        caps = node_capabilities(_dump(), sink)
-        if not format_supported(caps, audio_format):
-            raise ValueError(f'{audio_format} not supported by "{sink}".')
-        lines = [
-            MARKER.rstrip(),
-            'monitor.alsa.rules = [',
-            '  {',
-            '    matches = [',
-            f'      {{ node.name = "{sink}" }}',
-            '    ]',
-            '    actions = {',
-            '      update-props = {',
-            f'        audio.format = "{audio_format}"',
-            '      }',
-            '    }',
-            '  }',
-            ']',
-            '',
-        ]
-        BIT_CONFIG.parent.mkdir(parents=True, exist_ok=True)
-        fd, temp = tempfile.mkstemp(dir=BIT_CONFIG.parent, prefix='.audio-patchbay-')
-        try:
-            with os.fdopen(fd, 'w', encoding='utf-8') as stream:
-                stream.write('\n'.join(lines))
-            os.replace(temp, BIT_CONFIG)
-        finally:
-            Path(temp).unlink(missing_ok=True)
+    dir_fd = _config_dir_fd(create=True)
+    try:
+        _owned_marker_content(dir_fd, BIT_CONFIG_NAME)  # validates ownership before any write/removal
+        audio_format = BIT_PRESETS[preset]
+        if audio_format is None:
+            try:
+                os.unlink(BIT_CONFIG_NAME, dir_fd=dir_fd)
+            except FileNotFoundError:
+                pass
+        else:
+            sink = default_sink_name()
+            if not sink.startswith('alsa_output.'):
+                raise ValueError(
+                    f'Bit-depth override only supports local ALSA outputs; current default is "{sink}".'
+                )
+            caps = node_capabilities(_dump(), sink)
+            if not format_supported(caps, audio_format):
+                raise ValueError(f'{audio_format} not supported by "{sink}".')
+            content = '\n'.join([
+                MARKER.rstrip(),
+                'monitor.alsa.rules = [',
+                '  {',
+                '    matches = [',
+                f'      {{ node.name = "{sink}" }}',
+                '    ]',
+                '    actions = {',
+                '      update-props = {',
+                f'        audio.format = "{audio_format}"',
+                '      }',
+                '    }',
+                '  }',
+                ']',
+                '',
+            ])
+            temp_name = f'.audio-patchbay-{os.getpid()}.tmp'
+            fd = os.open(temp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600,
+                         dir_fd=dir_fd)
+            try:
+                with os.fdopen(fd, 'w', encoding='utf-8') as stream:
+                    stream.write(content)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.rename(temp_name, BIT_CONFIG_NAME, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+            except Exception:
+                try:
+                    os.unlink(temp_name, dir_fd=dir_fd)
+                except FileNotFoundError:
+                    pass
+                raise
+    finally:
+        os.close(dir_fd)
     run(['systemctl', '--user', 'restart', 'wireplumber'])
 
 
@@ -313,12 +479,17 @@ def status(objs):
         sink = ''
     bit_rule = ''
     try:
-        content = BIT_CONFIG.read_text(encoding='utf-8')
-        if content.startswith(MARKER):
-            match = re.search(r'audio\.format\s*=\s*"([^"]+)"', content)
-            if match:
-                bit_rule = match.group(1)
-    except (FileNotFoundError, OSError, UnicodeError):
+        dir_fd = _config_dir_fd(create=False)
+        if dir_fd is not None:
+            try:
+                content = _owned_marker_content(dir_fd, BIT_CONFIG_NAME)
+            finally:
+                os.close(dir_fd)
+            if content:
+                match = re.search(r'audio\.format\s*=\s*"([^"]+)"', content)
+                if match:
+                    bit_rule = match.group(1)
+    except (ValueError, OSError):
         pass
     capabilities = node_capabilities(objs, sink) if sink else {'rates': [], 'rateRanges': [], 'formats': []}
     return {
