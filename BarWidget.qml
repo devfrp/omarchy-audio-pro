@@ -20,6 +20,27 @@ Panel {
     // through inherited PATH, which a shadow executable earlier in PATH
     // could hijack (github.com/omacom/omarchy-plugin-marketplace#6521).
     readonly property string python3: "/usr/bin/python3"
+    // "-I" is Python's isolated mode: ignores PYTHONPATH/PYTHONSTARTUP/etc.
+    // and drops the script directory + user site-packages from sys.path,
+    // so nothing in the shell's inherited environment can influence
+    // interpreter startup before patchbay.py's own _closed_env() takes
+    // over for the tools it shells out to. Paired with clearEnvironment
+    // below on both Process blocks.
+    readonly property var pythonArgs: [python3, "-I"]
+    // Only what the helper actually needs to reach the session (PipeWire
+    // socket, D-Bus, config paths) — everything else inherited from this
+    // shell process (PYTHONPATH, LD_PRELOAD, arbitrary PATH entries, ...)
+    // is dropped via clearEnvironment on the Process itself.
+    readonly property var closedEnv: ({
+        "PATH": "/usr/bin:/bin",
+        "LC_ALL": "C",
+        "HOME": Quickshell.env("HOME"),
+        "USER": Quickshell.env("USER"),
+        "XDG_RUNTIME_DIR": Quickshell.env("XDG_RUNTIME_DIR"),
+        "XDG_CONFIG_HOME": Quickshell.env("XDG_CONFIG_HOME"),
+        "DBUS_SESSION_BUS_ADDRESS": Quickshell.env("DBUS_SESSION_BUS_ADDRESS"),
+        "WAYLAND_DISPLAY": Quickshell.env("WAYLAND_DISPLAY")
+    })
 
     readonly property var ratePresets: [
         { key: "auto", label: "Auto", rate: 0, buffer: 0 },
@@ -119,7 +140,7 @@ Panel {
         var preset = pendingPreset
         pendingKind = ""; pendingPreset = ""
         actionKind = kind
-        action.command = [python3, helper, kind, preset]
+        action.command = pythonArgs.concat([helper, kind, preset])
         action.running = true
     }
 
@@ -147,7 +168,7 @@ Panel {
 
     function doConnect(outId, inId) {
         actionKind = "connect"
-        action.command = [python3, helper, "connect", outId, inId]
+        action.command = pythonArgs.concat([helper, "connect", outId, inId])
         action.running = true
         clearRouteSelection()
     }
@@ -167,7 +188,7 @@ Panel {
     function disconnectLink(linkId) {
         if (busy) return
         actionKind = "disconnect"
-        action.command = [python3, helper, "disconnect", String(linkId)]
+        action.command = pythonArgs.concat([helper, "disconnect", String(linkId)])
         action.running = true
     }
 
@@ -175,7 +196,9 @@ Panel {
 
     Process {
         id: status
-        command: [root.python3, root.helper, "json"]
+        command: root.pythonArgs.concat([root.helper, "json"])
+        clearEnvironment: true
+        environment: root.closedEnv
         stdout: StdioCollector {
             onStreamFinished: {
                 try {
@@ -190,6 +213,8 @@ Panel {
 
     Process {
         id: action
+        clearEnvironment: true
+        environment: root.closedEnv
         stdout: StdioCollector { onStreamFinished: if (text.trim()) root.message = text.trim() }
         stderr: StdioCollector { onStreamFinished: if (text.trim()) { root.message = text.trim(); root.failed = true } }
         onExited: function(code) {

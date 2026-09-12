@@ -47,7 +47,15 @@ BIT_CONFIG_NAME = '70-audio-patchbay-bitdepth.conf'
 # hijack — and every subprocess runs with a closed-down environment, a real
 # wall-clock deadline enforced across its whole process group, and a cap on
 # how much stdout/stderr it may produce.
-TRUSTED_BIN_DIRS = ('/usr/bin', '/usr/local/bin', '/bin')
+#
+# TRUSTED_BIN_DIRS deliberately excludes /usr/local/bin: on most distros
+# that tree is writable by local package/admin tooling rather than only by
+# the base OS install, so trusting it would just relocate the shadow-
+# executable risk one directory over. Every resolved binary and every
+# directory in its path is also required to be root-owned and not
+# group/other-writable (_verify_trusted_ancestry) — matching the resolved
+# name against a fixed directory *string* isn't enough on its own.
+TRUSTED_BIN_DIRS = ('/usr/bin', '/bin')
 MAX_OUTPUT_BYTES = 8 * 1024 * 1024
 RUN_TIMEOUT_SECONDS = 8
 _TOOL_CACHE = {}
@@ -62,6 +70,24 @@ def _config_root():
     return Path.home() / '.config'
 
 
+def _is_root_owned_and_protected(path):
+    st = os.stat(path)
+    return st.st_uid == 0 and not (st.st_mode & (stat.S_IWGRP | stat.S_IWOTH))
+
+
+def _verify_trusted_ancestry(resolved_path):
+    """Every directory from / down to the resolved binary itself — not just
+    the final directory name — must be root-owned and not writable by group
+    or other, so nothing in the chain could have been swapped or written to
+    by a non-root local user."""
+    current = Path('/')
+    for part in Path(resolved_path).parts[1:]:
+        current = current / part
+        if not _is_root_owned_and_protected(current):
+            return False
+    return True
+
+
 def _trusted_tool(name):
     if name in _TOOL_CACHE:
         return _TOOL_CACHE[name]
@@ -71,6 +97,8 @@ def _trusted_tool(name):
             continue
         resolved = os.path.realpath(candidate)
         if os.path.dirname(resolved) not in TRUSTED_BIN_DIRS:
+            continue
+        if not _verify_trusted_ancestry(resolved):
             continue
         _TOOL_CACHE[name] = resolved
         return resolved
@@ -372,7 +400,14 @@ def _config_dir_fd(create):
         raise
 
 
+MAX_MARKER_FILE_BYTES = 64 * 1024  # generous for a config this plugin writes itself
+
+
 def _owned_marker_content(dir_fd, name):
+    """Read `name`'s content if it's a plain file we own, carrying our
+    marker — bounded to MAX_MARKER_FILE_BYTES so a status poll (this runs
+    on every refresh, unlike the once-per-action write path) can't be made
+    to read an unbounded amount of memory from an oversized owned file."""
     flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
     try:
         fd = os.open(name, flags, dir_fd=dir_fd)
@@ -382,11 +417,14 @@ def _owned_marker_content(dir_fd, name):
         if exc.errno == errno.ELOOP:
             raise ValueError(f'Refusing to touch a symlink: {name}') from exc
         raise
-    with os.fdopen(fd, 'r', encoding='utf-8') as stream:
+    with os.fdopen(fd, 'rb') as stream:
         stat_result = os.fstat(stream.fileno())
         if not stat.S_ISREG(stat_result.st_mode) or stat_result.st_uid != os.getuid():
             raise ValueError(f'Refusing to touch an unowned file: {name}')
-        content = stream.read()
+        raw = stream.read(MAX_MARKER_FILE_BYTES + 1)
+    if len(raw) > MAX_MARKER_FILE_BYTES:
+        raise ValueError(f'Refusing to read "{name}": larger than {MAX_MARKER_FILE_BYTES} bytes.')
+    content = raw.decode('utf-8')
     if not content.startswith(MARKER):
         raise ValueError(f'Refusing to touch an unowned file: {name}')
     return content
