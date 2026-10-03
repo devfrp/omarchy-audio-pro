@@ -67,7 +67,7 @@ on a standard PipeWire/WirePlumber system (no extra packages needed).
 python3 patchbay.py json             # full snapshot (graph + status + capabilities)
 python3 patchbay.py connect OUT IN   # connect two ports by id
 python3 patchbay.py disconnect LINK  # cut a connection by link id
-python3 patchbay.py rate PRESET      # auto|music|studio|hires
+python3 patchbay.py rate PRESET      # auto|music|studio|hires88|hires|ultra176|ultra|extreme352|extreme|max705|max
 python3 patchbay.py bitdepth PRESET  # auto|16|24|32
 omarchy plugin validate .
 ```

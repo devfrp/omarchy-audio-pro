@@ -46,9 +46,13 @@ Panel {
         { key: "auto", label: "Auto", rate: 0, buffer: 0 },
         { key: "music", label: "Music 44.1k", rate: 44100, buffer: 1024 },
         { key: "studio", label: "Studio 48k", rate: 48000, buffer: 256 },
+        { key: "hires88", label: "Hi-Res 88.2k", rate: 88200, buffer: 512 },
         { key: "hires", label: "Hi-Res 96k", rate: 96000, buffer: 512 },
+        { key: "ultra176", label: "Ultra 176.4k", rate: 176400, buffer: 1024 },
         { key: "ultra", label: "Ultra 192k", rate: 192000, buffer: 1024 },
+        { key: "extreme352", label: "Extreme 352.8k", rate: 352800, buffer: 2048 },
         { key: "extreme", label: "Extreme 384k", rate: 384000, buffer: 2048 },
+        { key: "max705", label: "Max 705.6k", rate: 705600, buffer: 4096 },
         { key: "max", label: "Max 768k", rate: 768000, buffer: 4096 }
     ]
     readonly property var bitPresets: [
